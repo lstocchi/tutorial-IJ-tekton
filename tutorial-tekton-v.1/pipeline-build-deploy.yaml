@@ -1,0 +1,169 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: build-and-deploy
+  namespace: tekton-pipelines
+spec:
+  params:
+  - description: url of the git repo for the code of deployment
+    name: git-url
+    type: string
+  - default: master
+    description: revision to be used from repo of the code for deployment
+    name: REVISION
+    type: string
+  - default: quay.io/lstocchi/react-web-app
+    name: IMAGE
+    type: string
+  - default: v1
+    name: TAG
+    type: string
+  - name: NAMESPACE
+    type: string
+  - default: openshift
+    name: K8S_VARIANT
+    type: string
+  tasks:
+  - name: fetch-repository
+    params:
+    - name: url
+      value: $(params.git-url)
+    - name: subdirectory
+      value: ""
+    - name: deleteExisting
+      value: "true"
+    - name: revision
+      value: $(params.REVISION)
+    taskRef:
+      kind: Task
+      name: git-clone
+    workspaces:
+    - name: output
+      workspace: shared-workspace
+  - name: install-dependencies
+    params:
+    - name: ARGS
+      value:
+      - clean-install
+    runAfter:
+    - fetch-repository
+    taskRef:
+      kind: Task
+      name: npm
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+  - name: run-lint
+    params:
+    - name: ARGS
+      value:
+      - run
+      - lint
+    runAfter:
+    - install-dependencies
+    taskRef:
+      kind: Task
+      name: npm
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+  - name: build-test
+    params:
+    - name: ARGS
+      value:
+      - run
+      - build
+    runAfter:
+    - install-dependencies
+    taskRef:
+      kind: Task
+      name: npm
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+  - name: unit-test
+    params:
+    - name: ARGS
+      value:
+      - run
+      - test
+    runAfter:
+    - run-lint
+    taskRef:
+      kind: Task
+      name: npm
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+  - name: build-push-image
+    params:
+    - name: IMAGE
+      value: $(params.IMAGE):$(params.TAG)
+    - name: FORMAT
+      value: docker
+    runAfter:
+    - unit-test
+    - build-test
+    taskRef:
+      kind: Task
+      name: buildah
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+  - name: check-ui-deployment
+    params:
+    - name: script
+      value: "kubectl -n $(params.NAMESPACE) describe deployment ui >/dev/null 2>/dev/null\n\
+        if [[ $? -eq 0 ]]; then\n  printf yes | tee /tekton/results/output-result\n\
+        else\n  printf no | tee /tekton/results/output-result\nfi\n"
+    runAfter:
+    - build-push-image
+    taskRef:
+      kind: Task
+      name: kubernetes-actions
+    workspaces:
+    - name: kubeconfig-dir
+      workspace: kubeconfig-dir
+  - name: patch-ui-image
+    params:
+    - name: script
+      value: "kubectl patch deployment ui --patch='{\"spec\":{\"template\":{\"spec\"\
+        :{\n  \"containers\":[{\n    \"name\": \"ui\",\n    \"image\": \"$(params.IMAGE):$(params.TAG)\"\
+        \n  }]\n}}}}' -n $(params.NAMESPACE)\n"
+    taskRef:
+      kind: Task
+      name: kubernetes-actions
+    when:
+    - input: $(tasks.check-ui-deployment.results.output-result)
+      operator: in
+      values:
+      - "yes"
+    workspaces:
+    - name: kubeconfig-dir
+      workspace: kubeconfig-dir
+  - name: create-deployment
+    params:
+    - name: script
+      value: "kubectl apply --filename config/03-ui\n[[ \"$(params.K8S_VARIANT)\"\
+        \ == \"openshift\" ]] && \\\nkubectl apply --filename config/04-openshift/41-ui-route.yaml\
+        \ || \\\nkubectl apply --filename config/04-kubernetes/41-ui-ingress.yaml\n\
+        # patch the latest built image\nkubectl patch deployment ui --patch='{\"spec\"\
+        :{\"template\":{\"spec\":{\n  \"containers\":[{\n    \"name\": \"ui\",\n \
+        \   \"image\": \"$(params.IMAGE):$(params.TAG)\"\n  }]\n}}}}' -n $(params.NAMESPACE)\n"
+    taskRef:
+      kind: Task
+      name: kubernetes-actions
+    when:
+    - input: $(tasks.check-ui-deployment.results.output-result)
+      operator: in
+      values:
+      - "no"
+    workspaces:
+    - name: manifest-dir
+      workspace: shared-workspace
+    - name: kubeconfig-dir
+      workspace: kubeconfig-dir
+  workspaces:
+  - name: shared-workspace
+  - name: kubeconfig-dir
+    optional: true
